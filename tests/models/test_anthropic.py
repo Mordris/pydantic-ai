@@ -65,6 +65,7 @@ from pydantic_ai import (
     UserContent,
     UserPromptPart,
     WebCitationSource,
+    capture_run_messages,
 )
 from pydantic_ai._agent_graph import ModelRequestNode
 from pydantic_ai._framing import SYSTEM_VOICE_ANNOUNCEMENT
@@ -16662,6 +16663,29 @@ async def test_pause_turn_exceeds_max_generation_continuations(allow_model_reque
         await agent.run('test prompt', usage_limits=UsageLimits(request_limit=None))
 
 
+_PAUSE_TURN_WEB_SEARCH_PROMPT = (
+    'Run a series of web searches to gather up-to-date context. '
+    'Do 6 separate searches, one at a time, and do not answer until all searches are complete. '
+    'Queries: '
+    '1) "San Francisco weather today", '
+    '2) "San Francisco sunrise time today", '
+    '3) "Golden Gate Bridge traffic today", '
+    '4) "San Francisco air quality today", '
+    '5) "San Francisco events this week", '
+    '6) "San Francisco ferry schedule today". '
+    '7) "prevailing information on quantum computing today", '
+    '8) "latest news on the stock market today", '
+    '9) "latest news on the weather in San Francisco today", '
+    '10) "latest news on the traffic in San Francisco today", '
+    '11) "latest news on the air quality in San Francisco today", '
+    '12) "latest news on the events in San Francisco this week", '
+    '13) "latest news on the ferry schedule in San Francisco today", '
+    '14) "latest news on the quantum computing in San Francisco today", '
+    '15) "latest news on the stock market in San Francisco today", '
+    'After the searches, provide a concise summary.'
+)
+
+
 @pytest.mark.vcr()
 async def test_pause_turn_web_search_vcr(
     allow_model_requests: None, anthropic_model: AnthropicModelFactory, request_capture: RequestCapture
@@ -16671,29 +16695,7 @@ async def test_pause_turn_web_search_vcr(
     settings = AnthropicModelSettings(anthropic_thinking={'type': 'enabled', 'budget_tokens': 4096}, max_tokens=15000)
     agent = Agent(model, capabilities=[NativeTool(WebSearchTool())], model_settings=settings)
 
-    prompt = (
-        'Run a series of web searches to gather up-to-date context. '
-        'Do 6 separate searches, one at a time, and do not answer until all searches are complete. '
-        'Queries: '
-        '1) "San Francisco weather today", '
-        '2) "San Francisco sunrise time today", '
-        '3) "Golden Gate Bridge traffic today", '
-        '4) "San Francisco air quality today", '
-        '5) "San Francisco events this week", '
-        '6) "San Francisco ferry schedule today". '
-        '7) "prevailing information on quantum computing today", '
-        '8) "latest news on the stock market today", '
-        '9) "latest news on the weather in San Francisco today", '
-        '10) "latest news on the traffic in San Francisco today", '
-        '11) "latest news on the air quality in San Francisco today", '
-        '12) "latest news on the events in San Francisco this week", '
-        '13) "latest news on the ferry schedule in San Francisco today", '
-        '14) "latest news on the quantum computing in San Francisco today", '
-        '15) "latest news on the stock market in San Francisco today", '
-        'After the searches, provide a concise summary.'
-    )
-
-    result = await agent.run(prompt)
+    result = await agent.run(_PAUSE_TURN_WEB_SEARCH_PROMPT)
 
     assert (request_capture.body()['tools'], request_capture.body().get('tool_choice')) == snapshot(
         (
@@ -16715,6 +16717,32 @@ async def test_pause_turn_web_search_vcr(
     # so they no longer appear as separate messages in the history. Verify the agent completed
     # successfully, which exercises the (non-streaming) continuation path end-to-end.
     assert result.output
+
+
+@pytest.mark.vcr('test_pause_turn_web_search_vcr.yaml')
+async def test_pause_turn_usage_limit_keeps_billed_response(
+    allow_model_requests: None, anthropic_model: AnthropicModelFactory
+):
+    """A token limit crossed during a real `pause_turn` continuation keeps the merged response, interrupted.
+
+    The recorded turn pauses after 792 output tokens, and its second segment completes it with 1,245 more, so a
+    1,500-token limit trips on the merge. A run resumed from the captured messages acts on the kept response
+    instead of requesting the turn again.
+    """
+    model = anthropic_model('claude-sonnet-4-5')
+    settings = AnthropicModelSettings(anthropic_thinking={'type': 'enabled', 'budget_tokens': 4096}, max_tokens=15000)
+    agent = Agent(model, capabilities=[NativeTool(WebSearchTool())], model_settings=settings)
+    with capture_run_messages() as messages:
+        with pytest.raises(UsageLimitExceeded, match='output_tokens_limit of 1500'):
+            await agent.run(_PAUSE_TURN_WEB_SEARCH_PROMPT, usage_limits=UsageLimits(output_tokens_limit=1500))
+
+    assert [(m.state, m.usage.output_tokens) for m in messages if isinstance(m, ModelResponse)] == [
+        ('interrupted', 2037)
+    ]
+
+    result = await agent.run(message_history=messages)
+    assert result.usage.requests == 0
+    assert result.output.startswith('Perfect! All 15 searches have been completed.')
 
 
 @pytest.mark.vcr()

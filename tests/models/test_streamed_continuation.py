@@ -937,6 +937,28 @@ async def test_nonstream_usage_limit_mid_continuation_recovered_by_hook_keeps_on
     assert usage.requests == 1
 
 
+async def test_nonstream_usage_limit_mid_continuation_converted_by_hook_keeps_no_response() -> None:
+    """A hook that turns a continuation's limit into another error fails the request, which keeps no response.
+
+    Only a limit that stops the run keeps the response billed so far, as a request that fails keeps none.
+    """
+
+    async def wrap(ctx: RunContext[Any], *, request_context: ModelRequestContext, handler: Any) -> ModelResponse:
+        try:
+            return await handler(request_context)
+        except UsageLimitExceeded as e:
+            raise RuntimeError('converted') from e
+
+    model = _continuation_model(False, [RequestUsage(input_tokens=1, output_tokens=100, cost=Decimal('0.012'))] * 3)
+    with capture_run_messages() as messages:
+        with pytest.raises(RuntimeError, match='converted'):
+            await Agent(model, capabilities=[Hooks(model_request=wrap)]).run(
+                'go', usage_limits=UsageLimits(cost_limit=Decimal('0.01'))
+            )
+
+    assert [m for m in messages if isinstance(m, ModelResponse)] == []
+
+
 async def test_nonstream_usage_limit_on_completed_merge_does_not_cancel() -> None:
     """A token-limit trip on an already-`'complete'` final merge raises without cancelling anything.
 

@@ -2119,7 +2119,8 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
             if _limit_stopped is not None and isinstance(e, exceptions.UsageLimitExceeded):
                 # No hook recovered from the limit, so the run stops before acting on the response billed so far: it's
                 # kept, as `_finish_handling` keeps one a limit stops the run on, and interrupted, as a still-suspended
-                # one's job was cancelled. Committing it any earlier would leave two responses when a hook recovers.
+                # one's job was cancelled. Committing it any earlier would leave two responses when a hook recovers. A
+                # hook that turns the limit into another error fails the request instead, which keeps no response.
                 self._append_response(ctx, replace(_limit_stopped, state='interrupted'), record_usage=False)
             raise
 

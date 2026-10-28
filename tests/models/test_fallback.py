@@ -2120,11 +2120,14 @@ async def test_rejected_usage_counts_towards_limits_before_a_continuation() -> N
 
 
 @pytest.mark.moves_cache_prefix(reason=FALLBACK_REWINDS)
-async def test_rejected_usage_crossing_a_limit_after_a_failed_continuation_keeps_no_response() -> None:
-    """A limit the chain's rejected attempts cross, once a pinned continuation fails, keeps none of the turn's responses.
+async def test_rejected_usage_crossing_a_limit_after_a_failed_continuation_does_not_keep_the_abandoned_segment() -> (
+    None
+):
+    """A limit the chain's rejected attempts cross, once a pinned continuation fails, doesn't keep the abandoned segment.
 
     The pinned model's suspended segment was abandoned for the chain, and the limit is raised for the attempts the
-    chain rejected, not by the continuation's own limit check, which would keep the segment billed so far.
+    chain rejected, not by the continuation's own limit check, which would keep the segment billed so far. Whether the
+    response the chain rejected is kept is a separate question: https://github.com/pydantic/pydantic-ai/issues/11425
     """
     primary_calls = 0
 
@@ -2151,7 +2154,7 @@ async def test_rejected_usage_crossing_a_limit_after_a_failed_continuation_keeps
         with pytest.raises(UsageLimitExceeded, match='input_tokens_limit') as exc_info:
             await Agent(model).run('test', usage_limits=UsageLimits(input_tokens_limit=20))
     assert isinstance(exc_info.value.__cause__, FallbackExceptionGroup)
-    assert [message for message in messages if isinstance(message, ModelResponse)] == []
+    assert 'paused' not in [message.text for message in messages if isinstance(message, ModelResponse)]
 
 
 async def test_rejected_usage_counts_towards_token_limits() -> None:
