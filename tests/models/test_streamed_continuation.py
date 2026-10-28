@@ -858,7 +858,38 @@ async def test_nonstream_usage_limit_mid_continuation_keeps_billed_usage(resumed
             usage_limits=UsageLimits(input_tokens_limit=5),
         )
 
-    assert usage == RunUsage(input_tokens=100, output_tokens=1)
+    assert usage == RunUsage(input_tokens=100, output_tokens=1, requests=1)
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('trip', ['first-segment', 'merge'])
+async def test_usage_limit_mid_continuation_keeps_billed_response(stream: bool, trip: str) -> None:
+    """A continuation that trips a limit keeps the response billed so far in the run's messages, interrupted.
+
+    Its job was cancelled, so it can't be continued as `'suspended'`: a run resumed from the messages acts on
+    it instead of requesting it again, as for any response a limit stops the run on.
+    """
+    # A cost limit, as token limits are also checked while a segment streams, before its text arrives here. A
+    # 0.012 segment trips the 0.01 limit on its own, a 0.006 one on its merge with the second.
+    cost = Decimal('0.012') if trip == 'first-segment' else Decimal('0.006')
+    model = _continuation_model(stream, [RequestUsage(input_tokens=1, output_tokens=100, cost=cost)] * 3)
+    agent = Agent(model)
+    limits = UsageLimits(cost_limit=Decimal('0.01'))
+    with capture_run_messages() as messages:
+        with pytest.raises(UsageLimitExceeded):
+            if stream:
+                async with agent.run_stream('go', usage_limits=limits) as result:
+                    await result.get_output()
+            else:
+                await agent.run('go', usage_limits=limits)
+
+    billed_calls = model.request_calls + model.request_stream_calls
+    assert [(m.state, m.usage.output_tokens) for m in messages if isinstance(m, ModelResponse)] == [
+        ('interrupted', 100 if trip == 'first-segment' else 200)
+    ]
+
+    await agent.run(message_history=messages)
+    assert model.request_calls + model.request_stream_calls == billed_calls
 
 
 async def test_nonstream_usage_limit_on_completed_merge_does_not_cancel() -> None:

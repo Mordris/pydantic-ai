@@ -2017,7 +2017,7 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
             _event_stream_buffer_getter=lambda: ctx.state.event_stream_buffer,
         )
 
-    async def _make_request(
+    async def _make_request(  # noqa: C901
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
     ) -> CallToolsNode[DepsT, NodeRunEndT] | ModelRequestNode[DepsT, NodeRunEndT]:
         if self._result is not None:
@@ -2078,7 +2078,14 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                     accounted_responses.append(_handler_response)
                 if not isinstance(e, Exception):
                     raise
-                response = await self._recover_model_request_error(ctx, run_context, req_ctx, e)
+                try:
+                    response = await self._recover_model_request_error(ctx, run_context, req_ctx, e)
+                except exceptions.UsageLimitExceeded:
+                    if _handler_response is not None:
+                        # The run stops before acting on the response it billed, so it's kept, as `_finish_handling`
+                        # keeps one a limit stops the run on. Its job was cancelled, so it's interrupted, not suspended.
+                        self._append_response(ctx, replace(_handler_response, state='interrupted'), record_usage=False)
+                    raise
             _handler_response = response
             capture_model_response_span_context(req_ctx, response)
             return await ctx.deps.root_capability.after_model_request(
