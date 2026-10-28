@@ -2028,12 +2028,14 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
         _handler_response: _messages.ModelResponse | None = None
         _handler_called = False
         _handler_usage_recorded = False
+        # The response billed so far when the continuation's own usage limit stopped the request.
+        _limit_stopped: _messages.ModelResponse | None = None
         # The pending response the request returned, which the run ends with unless a hook rejects it.
         _pending: tuple[ModelRequestContext, _messages.ModelResponse] | None = None
         accounted_responses: list[_messages.ModelResponse] = []
 
         async def model_handler(req_ctx: ModelRequestContext) -> _messages.ModelResponse:
-            nonlocal _handler_called, _handler_response, _handler_usage_recorded, _pending
+            nonlocal _handler_called, _handler_response, _handler_usage_recorded, _pending, _limit_stopped
             if _handler_called:
                 raise exceptions.UserError('`wrap_model_request` may call its handler only once')
             _handler_called = True
@@ -2078,17 +2080,11 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                     accounted_responses.append(_handler_response)
                 if not isinstance(e, Exception):
                     raise
-                try:
-                    response = await self._recover_model_request_error(ctx, run_context, req_ctx, e)
-                except exceptions.UsageLimitExceeded:
-                    if isinstance(e, exceptions.UsageLimitExceeded) and _handler_response is not None:
-                        # Only a limit the continuation itself tripped keeps its response, not one a `FallbackModel`'s
-                        # rejected attempts tripped. The run stops before acting on the response billed so far, so it's
-                        # kept, as `_finish_handling` keeps one a limit stops the run on, and interrupted, as a
-                        # still-suspended one's job was cancelled. It's committed only after recovery fails: a hook that
-                        # recovers would otherwise leave two responses for one request.
-                        self._append_response(ctx, replace(_handler_response, state='interrupted'), record_usage=False)
-                    raise
+                if isinstance(e, exceptions.UsageLimitExceeded):
+                    # The request's own limit, not one `_recover_model_request_error` raises for the attempts a
+                    # `FallbackModel` rejected, which keeps no response.
+                    _limit_stopped = _handler_response
+                response = await self._recover_model_request_error(ctx, run_context, req_ctx, e)
             _handler_response = response
             capture_model_response_span_context(req_ctx, response)
             return await ctx.deps.root_capability.after_model_request(
@@ -2118,8 +2114,13 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
             if _handler_response is not None:
                 self._append_response(ctx, _handler_response, record_usage=not _handler_usage_recorded)
             return await self._build_retry_node(ctx, e)
-        except BaseException:
+        except BaseException as e:
             await _settle_pending(_pending, None)
+            if _limit_stopped is not None and isinstance(e, exceptions.UsageLimitExceeded):
+                # No hook recovered from the limit, so the run stops before acting on the response billed so far: it's
+                # kept, as `_finish_handling` keeps one a limit stops the run on, and interrupted, as a still-suspended
+                # one's job was cancelled. Committing it any earlier would leave two responses when a hook recovers.
+                self._append_response(ctx, replace(_limit_stopped, state='interrupted'), record_usage=False)
             raise
 
         return await self._finish_handling_pending(
@@ -3725,7 +3726,7 @@ def capture_run_messages() -> Generator[list[_messages.ModelMessage]]:
     [`ModelRequest`][pydantic_ai.messages.ModelRequest] is still captured here with
     `state='interrupted'`, so consumers can detect and inspect partial state. A response that crossed a
     token or cost usage limit is captured with `state='interrupted'` too, since the run stopped before
-    acting on it, though it arrived complete.
+    acting on it, even if it arrived complete.
     """
     messages: list[_messages.ModelMessage] = []
     # Always push a fresh context so nested `capture_run_messages` contexts each capture their own runs,

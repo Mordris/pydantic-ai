@@ -863,18 +863,19 @@ async def test_nonstream_usage_limit_mid_continuation_keeps_billed_usage(resumed
 
 @pytest.mark.parametrize('stream', [False, True])
 @pytest.mark.parametrize(
-    ('cost', 'billed_tokens'),
+    ('cost', 'billed_tokens', 'output'),
     [
-        # A cost limit, as token limits are also checked while a segment streams, before its text arrives here. Of
-        # three 100-token segments, a 0.012 one trips the 0.01 limit on its own, a 0.006 one on its merge with the
-        # second, and a 0.004 one only on the final merge, which has already completed.
-        pytest.param(Decimal('0.012'), 100, id='first-segment'),
-        pytest.param(Decimal('0.006'), 200, id='merge'),
-        pytest.param(Decimal('0.004'), 300, id='final-merge'),
+        # Cost limits, not token limits: the scripted stream reports a segment's usage before its text, so a token
+        # limit would stop a streamed segment before any text arrived. Of three 100-token segments, a 0.012 one trips
+        # the 0.01 limit on its own, a 0.006 one on its merge with the second, and a 0.004 one only on the final
+        # merge, which has already completed.
+        pytest.param(Decimal('0.012'), 100, 'a', id='first-segment'),
+        pytest.param(Decimal('0.006'), 200, 'ab', id='merge'),
+        pytest.param(Decimal('0.004'), 300, 'abc', id='final-merge'),
     ],
 )
 async def test_usage_limit_mid_continuation_keeps_billed_response(
-    stream: bool, cost: Decimal, billed_tokens: int
+    stream: bool, cost: Decimal, billed_tokens: int, output: str
 ) -> None:
     """A continuation that trips a limit keeps the response billed so far in the run's messages, interrupted.
 
@@ -897,8 +898,43 @@ async def test_usage_limit_mid_continuation_keeps_billed_response(
         ('interrupted', billed_tokens)
     ]
 
-    await agent.run(message_history=messages)
+    result = await agent.run(message_history=messages)
+    assert result.output == output
     assert model.request_calls + model.request_stream_calls == billed_calls
+
+
+@pytest.mark.parametrize('hook', ['on_model_request_error', 'wrap_model_request'])
+async def test_nonstream_usage_limit_mid_continuation_recovered_by_hook_keeps_one_response(hook: str) -> None:
+    """A hook that recovers from a continuation's limit leaves only the response it returned in history.
+
+    The response billed so far is kept only once no hook recovers, so the request still leaves one response:
+    the recovered one, interrupted, as the limit then stops the run on it.
+    """
+    recovered = ModelResponse(parts=[TextPart('recovered')])
+
+    async def on_error(
+        ctx: RunContext[Any], *, request_context: ModelRequestContext, error: Exception
+    ) -> ModelResponse:
+        assert isinstance(error, UsageLimitExceeded)
+        return recovered
+
+    async def wrap(ctx: RunContext[Any], *, request_context: ModelRequestContext, handler: Any) -> ModelResponse:
+        try:
+            return await handler(request_context)
+        except UsageLimitExceeded:
+            return recovered
+
+    hooks = Hooks(model_request_error=on_error) if hook == 'on_model_request_error' else Hooks(model_request=wrap)
+    model = _continuation_model(False, [RequestUsage(input_tokens=1, output_tokens=100, cost=Decimal('0.012'))] * 3)
+    usage = RunUsage()
+    with capture_run_messages() as messages:
+        with pytest.raises(UsageLimitExceeded):
+            await Agent(model, capabilities=[hooks]).run(
+                'go', usage=usage, usage_limits=UsageLimits(cost_limit=Decimal('0.01'))
+            )
+
+    assert [(m.state, m.text) for m in messages if isinstance(m, ModelResponse)] == [('interrupted', 'recovered')]
+    assert usage.requests == 1
 
 
 async def test_nonstream_usage_limit_on_completed_merge_does_not_cancel() -> None:

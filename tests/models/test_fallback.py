@@ -36,6 +36,7 @@ from pydantic_ai import (
     UsageLimitExceeded,
     UserError,
     UserPromptPart,
+    capture_run_messages,
 )
 from pydantic_ai._agent_graph import ModelRequestNode
 from pydantic_ai._run_context import RunContext
@@ -2116,6 +2117,41 @@ async def test_rejected_usage_counts_towards_limits_before_a_continuation() -> N
     with pytest.raises(UsageLimitExceeded, match='cost_limit'):
         await Agent(model).run('test', usage_limits=UsageLimits(cost_limit=Decimal('0.01')))
     assert backup_calls == 1
+
+
+@pytest.mark.moves_cache_prefix(reason=FALLBACK_REWINDS)
+async def test_rejected_usage_crossing_a_limit_after_a_failed_continuation_keeps_no_response() -> None:
+    """A limit the chain's rejected attempts cross, once a pinned continuation fails, keeps none of the turn's responses.
+
+    The pinned model's suspended segment was abandoned for the chain, and the limit is raised for the attempts the
+    chain rejected, not by the continuation's own limit check, which would keep the segment billed so far.
+    """
+    primary_calls = 0
+
+    def primary(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal primary_calls
+        primary_calls += 1
+        if primary_calls == 1:
+            return ModelResponse(parts=[TextPart('paused')], usage=RequestUsage(input_tokens=5), state='suspended')
+        raise ModelHTTPError(500, 'primary')
+
+    def backup(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart('rejected')], usage=RequestUsage(input_tokens=50))
+
+    def reject_backup(response: ModelResponse) -> bool:
+        return response.model_name == 'backup'
+
+    model = FallbackModel(
+        FunctionModel(primary, model_name='primary'),
+        FunctionModel(backup, model_name='backup'),
+        fallback_on=[ModelAPIError, reject_backup],
+    )
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UsageLimitExceeded, match='input_tokens_limit') as exc_info:
+            await Agent(model).run('test', usage_limits=UsageLimits(input_tokens_limit=20))
+    assert isinstance(exc_info.value.__cause__, FallbackExceptionGroup)
+    assert [message for message in messages if isinstance(message, ModelResponse)] == []
 
 
 async def test_rejected_usage_counts_towards_token_limits() -> None:
