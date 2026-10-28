@@ -862,16 +862,25 @@ async def test_nonstream_usage_limit_mid_continuation_keeps_billed_usage(resumed
 
 
 @pytest.mark.parametrize('stream', [False, True])
-@pytest.mark.parametrize('trip', ['first-segment', 'merge'])
-async def test_usage_limit_mid_continuation_keeps_billed_response(stream: bool, trip: str) -> None:
+@pytest.mark.parametrize(
+    ('cost', 'billed_tokens'),
+    [
+        # A cost limit, as token limits are also checked while a segment streams, before its text arrives here. Of
+        # three 100-token segments, a 0.012 one trips the 0.01 limit on its own, a 0.006 one on its merge with the
+        # second, and a 0.004 one only on the final merge, which has already completed.
+        pytest.param(Decimal('0.012'), 100, id='first-segment'),
+        pytest.param(Decimal('0.006'), 200, id='merge'),
+        pytest.param(Decimal('0.004'), 300, id='final-merge'),
+    ],
+)
+async def test_usage_limit_mid_continuation_keeps_billed_response(
+    stream: bool, cost: Decimal, billed_tokens: int
+) -> None:
     """A continuation that trips a limit keeps the response billed so far in the run's messages, interrupted.
 
-    Its job was cancelled, so it can't be continued as `'suspended'`: a run resumed from the messages acts on
-    it instead of requesting it again, as for any response a limit stops the run on.
+    The run stops before acting on it, as for any response a limit stops the run on, so a run resumed from the
+    messages acts on it instead of requesting it again. A still-suspended one can't be continued: its job was cancelled.
     """
-    # A cost limit, as token limits are also checked while a segment streams, before its text arrives here. A
-    # 0.012 segment trips the 0.01 limit on its own, a 0.006 one on its merge with the second.
-    cost = Decimal('0.012') if trip == 'first-segment' else Decimal('0.006')
     model = _continuation_model(stream, [RequestUsage(input_tokens=1, output_tokens=100, cost=cost)] * 3)
     agent = Agent(model)
     limits = UsageLimits(cost_limit=Decimal('0.01'))
@@ -885,7 +894,7 @@ async def test_usage_limit_mid_continuation_keeps_billed_response(stream: bool, 
 
     billed_calls = model.request_calls + model.request_stream_calls
     assert [(m.state, m.usage.output_tokens) for m in messages if isinstance(m, ModelResponse)] == [
-        ('interrupted', 100 if trip == 'first-segment' else 200)
+        ('interrupted', billed_tokens)
     ]
 
     await agent.run(message_history=messages)

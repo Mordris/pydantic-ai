@@ -2081,9 +2081,12 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                 try:
                     response = await self._recover_model_request_error(ctx, run_context, req_ctx, e)
                 except exceptions.UsageLimitExceeded:
-                    if _handler_response is not None:
-                        # The run stops before acting on the response it billed, so it's kept, as `_finish_handling`
-                        # keeps one a limit stops the run on. Its job was cancelled, so it's interrupted, not suspended.
+                    if isinstance(e, exceptions.UsageLimitExceeded) and _handler_response is not None:
+                        # Only a limit the continuation itself tripped keeps its response, not one a `FallbackModel`'s
+                        # rejected attempts tripped. The run stops before acting on the response billed so far, so it's
+                        # kept, as `_finish_handling` keeps one a limit stops the run on, and interrupted, as a
+                        # still-suspended one's job was cancelled. It's committed only after recovery fails: a hook that
+                        # recovers would otherwise leave two responses for one request.
                         self._append_response(ctx, replace(_handler_response, state='interrupted'), record_usage=False)
                     raise
             _handler_response = response
