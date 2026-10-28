@@ -2114,16 +2114,20 @@ async def test_rejected_usage_counts_towards_limits_before_a_continuation() -> N
         fallback_on=reject_primary,
     )
 
-    with pytest.raises(UsageLimitExceeded, match='cost_limit'):
-        await Agent(model).run('test', usage_limits=UsageLimits(cost_limit=Decimal('0.01')))
+    with capture_run_messages() as messages:
+        with pytest.raises(UsageLimitExceeded, match='cost_limit'):
+            await Agent(model).run('test', usage_limits=UsageLimits(cost_limit=Decimal('0.01')))
     assert backup_calls == 1
+    # The continuation's own limit check counts the rejected attempt, and keeps the response the chain accepted, as a
+    # plain request keeps one when rejected attempts take it over a limit.
+    assert [(m.state, m.text) for m in messages if isinstance(m, ModelResponse)] == [('interrupted', 'paused')]
 
 
 @pytest.mark.moves_cache_prefix(reason=FALLBACK_REWINDS)
 async def test_rejected_usage_crossing_a_limit_after_a_failed_continuation_does_not_keep_the_abandoned_segment() -> (
     None
 ):
-    """A limit the chain's rejected attempts cross, once a pinned continuation fails, doesn't keep the abandoned segment.
+    """A limit the chain's rejected attempts cross, once a pinned continuation fails, keeps no abandoned segment.
 
     The pinned model's suspended segment was abandoned for the chain, and the limit is raised for the attempts the
     chain rejected, not by the continuation's own limit check, which would keep the segment billed so far. Whether the

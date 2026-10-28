@@ -937,10 +937,10 @@ async def test_nonstream_usage_limit_mid_continuation_recovered_by_hook_keeps_on
     assert usage.requests == 1
 
 
-async def test_nonstream_usage_limit_mid_continuation_converted_by_hook_keeps_no_response() -> None:
-    """A hook that turns a continuation's limit into another error fails the request, which keeps no response.
+async def test_nonstream_usage_limit_mid_continuation_converted_by_hook_keeps_billed_response() -> None:
+    """A hook that turns a continuation's limit into another error still leaves the response billed so far in history.
 
-    Only a limit that stops the run keeps the response billed so far, as a request that fails keeps none.
+    The limit stopped the request, as it stops a plain or streamed request, where it's checked outside the hooks.
     """
 
     async def wrap(ctx: RunContext[Any], *, request_context: ModelRequestContext, handler: Any) -> ModelResponse:
@@ -956,7 +956,7 @@ async def test_nonstream_usage_limit_mid_continuation_converted_by_hook_keeps_no
                 'go', usage_limits=UsageLimits(cost_limit=Decimal('0.01'))
             )
 
-    assert [m for m in messages if isinstance(m, ModelResponse)] == []
+    assert [(m.state, m.text) for m in messages if isinstance(m, ModelResponse)] == [('interrupted', 'a')]
 
 
 async def test_nonstream_usage_limit_on_completed_merge_does_not_cancel() -> None:

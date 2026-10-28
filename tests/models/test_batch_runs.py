@@ -31,6 +31,7 @@ from pydantic_ai import (
     TextPart,
     ToolCallPart,
     UsageLimitExceeded,
+    capture_run_messages,
 )
 from pydantic_ai.capabilities import AbstractCapability, BatchModelRequests, SelectModel
 from pydantic_ai.capabilities.abstract import AgentNode, NodeResult, WrapRunHandler
@@ -567,6 +568,27 @@ async def test_usage_limits_apply_to_batched_runs() -> None:
     result = await agent.run('Where?', usage_limits=UsageLimits(request_limit=2))
     assert result.usage.requests == 2
     assert len(wrapped.created) == 3
+
+
+async def test_token_limit_on_a_batch_result_keeps_it() -> None:
+    """A token limit crossed by a batch's result keeps it in the run's messages, interrupted.
+
+    The result completes the request's suspended batch ticket, so a run resumed from the messages acts on it
+    instead of submitting another batch.
+    """
+    wrapped = SlowBatchTestModel()
+
+    def agent() -> Agent[None, str]:
+        return Agent(wrapped, capabilities=[BatchModelRequests(**FAST_BATCH_SETTINGS)])
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UsageLimitExceeded, match='total_tokens_limit'):
+            await agent().run('Hello', usage_limits=UsageLimits(total_tokens_limit=10))
+    assert [(m.state, m.usage.total_tokens) for m in messages if isinstance(m, ModelResponse)] == [('interrupted', 55)]
+
+    result = await agent().run(message_history=messages)
+    assert result.output == 'success (no tool calls)'
+    assert len(wrapped.created) == 1
 
 
 async def test_each_run_of_a_pending_cycle_counts_the_response_it_acted_on() -> None:

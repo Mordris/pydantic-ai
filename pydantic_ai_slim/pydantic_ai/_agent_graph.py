@@ -2081,8 +2081,8 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                 if not isinstance(e, Exception):
                     raise
                 if isinstance(e, exceptions.UsageLimitExceeded):
-                    # The request's own limit, not one `_recover_model_request_error` raises for the attempts a
-                    # `FallbackModel` rejected, which keeps no response.
+                    # A limit the request itself raised, counting any attempts a `FallbackModel` rejected. One that
+                    # `_recover_model_request_error` raises once the fallback chain has failed keeps no response.
                     _limit_stopped = _handler_response
                 response = await self._recover_model_request_error(ctx, run_context, req_ctx, e)
             _handler_response = response
@@ -2116,11 +2116,11 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
             return await self._build_retry_node(ctx, e)
         except BaseException as e:
             await _settle_pending(_pending, None)
-            if _limit_stopped is not None and isinstance(e, exceptions.UsageLimitExceeded):
-                # No hook recovered from the limit, so the run stops before acting on the response billed so far: it's
+            if _limit_stopped is not None and isinstance(e, Exception):
+                # The request's own limit stopped it and it ends in an error rather than a response, even if a hook
+                # turned the limit into another one, so the run stops before acting on the response billed so far: it's
                 # kept, as `_finish_handling` keeps one a limit stops the run on, and interrupted, as a still-suspended
-                # one's job was cancelled. Committing it any earlier would leave two responses when a hook recovers. A
-                # hook that turns the limit into another error fails the request instead, which keeps no response.
+                # one's job was cancelled. Committing it any earlier would leave two responses when a hook recovers.
                 self._append_response(ctx, replace(_limit_stopped, state='interrupted'), record_usage=False)
             raise
 
