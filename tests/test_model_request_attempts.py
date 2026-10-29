@@ -23,13 +23,13 @@ from pydantic_ai.capabilities import (
     WrapModelRequestHandler,
     WrapperCapability,
 )
-from pydantic_ai.exceptions import ModelAPIError, ModelRetry, RetryModelRequest, UserError
+from pydantic_ai.exceptions import ModelAPIError, ModelRetry, RetryModelRequest, UsageLimitExceeded, UserError
 from pydantic_ai.messages import AgentStreamEvent, ModelRequest, ModelRequestAttempt, UserPromptPart
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import AgentInfo, DeltaToolCalls, FunctionModel
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.usage import RequestUsage
+from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from .continuation_utils import ScriptedContinuationModel, StreamSegment, scripted_response
 
@@ -62,7 +62,7 @@ class RetrySameModelOnError(AbstractCapability[None]):
     ) -> ModelResponse:
         if request_context.attempt == 1:
             raise RetryModelRequest()
-        raise error  # pragma: no cover
+        raise error
 
 
 async def test_prepare_model_request_runs_per_attempt_and_before_model_request_once():
@@ -707,6 +707,49 @@ async def test_a_recovered_response_keeps_the_attempts_that_failed_before_it():
     assert _attempt_outcomes(result.all_messages()[-1]) == [('error', 'ModelAPIError: boom')]
     # The recovered response was never billed, and the failed attempt reported no usage.
     assert (result.usage.requests, result.usage.input_tokens, result.usage.output_tokens) == (1, 0, 0)
+
+
+def pauses_over_the_limit(calls: list[int], *, fail_first: bool) -> FunctionModel:
+    """A model whose turn pauses over the tests' output token limit, after a failed first call when `fail_first`."""
+
+    def fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls.append(len(calls) + 1)
+        if calls == [1] and fail_first:
+            raise ModelAPIError(model_name='m', message='boom')
+        return ModelResponse(parts=[TextPart('paused')], usage=RequestUsage(output_tokens=200), state='suspended')
+
+    return FunctionModel(fn, model_name='m')
+
+
+async def test_a_retried_attempt_keeps_no_response_its_continuation_limit_stopped():
+    """A hook that moves on from an attempt a continuation's limit stopped leaves its billed response out of history.
+
+    As for any response a hook moves on from: the same limit then stops the next attempt before it's sent.
+    """
+    calls: list[int] = []
+    agent = Agent(
+        pauses_over_the_limit(calls, fail_first=False), deps_type=type(None), capabilities=[RetrySameModelOnError()]
+    )
+    with capture_run_messages() as messages:
+        with pytest.raises(UsageLimitExceeded, match='output_tokens_limit'):
+            await agent.run('x', usage_limits=UsageLimits(output_tokens_limit=150))
+    assert calls == [1]
+    assert [m for m in messages if isinstance(m, ModelResponse)] == []
+
+
+async def test_a_continuation_limit_keeps_the_attempts_that_failed_before_it():
+    """The response a continuation's limit stops a later attempt on is kept with the attempts that failed before it."""
+    calls: list[int] = []
+    agent = Agent(
+        pauses_over_the_limit(calls, fail_first=True), deps_type=type(None), capabilities=[RetrySameModelOnError()]
+    )
+    with capture_run_messages() as messages:
+        with pytest.raises(UsageLimitExceeded, match='output_tokens_limit'):
+            await agent.run('x', usage_limits=UsageLimits(output_tokens_limit=150))
+    assert calls == [1, 2]
+    assert [(m.state, _attempt_outcomes(m)) for m in messages if isinstance(m, ModelResponse)] == [
+        ('interrupted', [('error', 'ModelAPIError: boom')])
+    ]
 
 
 async def test_a_recovered_stream_keeps_the_attempts_that_failed_before_it():
